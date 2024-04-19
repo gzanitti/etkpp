@@ -2,7 +2,7 @@
 
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](https://github.com/gzanitti/etkpp)
 
-`etk` is a for of the original [ETK](https://github.com/quilt/etk), a collection of tools for writing, reading, and analyzing EVM bytecode, but with new features, tweaks and small modifications.
+`etk` is a fork of the original [ETK](https://github.com/quilt/etk), a collection of tools for writing, reading, and analyzing EVM bytecode, but with new features, tweaks and small modifications.
 
 ## Documentation
 
@@ -41,3 +41,7 @@ sudo apt-get install -y libz3-dev
 ```
 
 Check the system logs to confirm that there are no related errors.
+
+### Disclaimer
+
+While the original ETK developers are aware of the existence of this project, none of the design decisions, bugs or problems that may come along with the use of ETK++ should be associated with them. In the event that they consider that a feature of ETK++ should be adopted, it will be included and made available in the original project.
