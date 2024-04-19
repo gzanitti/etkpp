@@ -39,8 +39,8 @@ stop
 
 The `%include` macro expands to the instructions read from another file, but unlike `%import`, the included file is assembled independently from the current file:
 
- - Labels from the included file are _not_ available in the including file, and vise versa.
- - The address of the first instruction in the included file will be zero.
+- Labels from the included file are _not_ available in the including file, and vise versa.
+- The address of the first instruction in the included file will be zero.
 
 The path is resolved relative to the current file.
 
@@ -79,6 +79,7 @@ For example:
 
 ```rust
 # extern crate etk_asm;
+# extern crate etk_ops;
 # let src = r#"
 %push(hello)
 
@@ -86,7 +87,7 @@ hello:
     jumpdest
 # "#;
 # let mut output = Vec::new();
-# let mut ingest = etk_asm::ingest::Ingest::new(&mut output);
+# let mut ingest = etk_asm::ingest::Ingest::new(&mut output, etk_ops::HardFork::Cancun);
 # ingest.ingest(file!(), src).unwrap();
 # assert_eq!(output, &[0x60, 0x02, 0x5b]);
 ```
@@ -108,11 +109,12 @@ For example:
 
 ```rust
 # extern crate etk_asm;
+# extern crate etk_ops;
 # let src = r#"
 push4 selector("transfer(address,uint256)")    # <- expands to 0x63a9059cbb
 # "#;
 # let mut output = Vec::new();
-# let mut ingest = etk_asm::ingest::Ingest::new(&mut output);
+# let mut ingest = etk_asm::ingest::Ingest::new(&mut output, etk_ops::HardFork::Cancun);
 # ingest.ingest(file!(), src).unwrap();
 # assert_eq!(output, &[0x63, 0xa9, 0x05, 0x9c, 0xbb]);
 ```
@@ -131,11 +133,12 @@ For example:
 
 ```rust
 # extern crate etk_asm;
+# extern crate etk_ops;
 # let src = r#"
 push32 topic("transfer(address,uint256)")
 # "#;
 # let mut output = Vec::new();
-# let mut ingest = etk_asm::ingest::Ingest::new(&mut output);
+# let mut ingest = etk_asm::ingest::Ingest::new(&mut output, etk_ops::HardFork::Cancun);
 # ingest.ingest(file!(), src).unwrap();
 # assert_eq!(output, &[0x7f, 169, 5, 156, 187, 42, 176, 158, 178, 25, 88, 63, 74, 89, 165, 208, 98, 58, 222, 52, 109, 150, 43, 205, 78, 70, 177, 29, 160, 71, 201, 4, 155]);
 ```
@@ -145,5 +148,29 @@ The fully expanded source would look like:
 ```ignore
 push32 0xa9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b
 ```
+
+## Hardfork selection
+
+### `%hardfork(...)`
+
+The `%hardfork` macro is useful when you want to restrict the hardfork range in which the code can be compiled.
+
+For example:
+
+```rust
+# extern crate etk_asm;
+# extern crate etk_ops;
+# let src = r#"
+%hardfork(">london,<=cancun")
+
+%push(0x08)
+# "#;
+# let mut output = Vec::new();
+# let mut ingest = etk_asm::ingest::Ingest::new(&mut output, etk_ops::HardFork::Cancun);
+# ingest.ingest(file!(), src).unwrap();
+# assert_eq!(output, &[0x60, 0x08]);
+```
+
+can only be compiled by specifying a hardfork using the `--hardfork` flag (with the latest hardfork implemented as the default option) strictly after `London` and equal or older than `Cancun`. Non-closed ranges can also be used, as well as specific versions (e.g. `%hardfork(">london")`, `%hardfork("cancun")` and `%hardfork(">=cancun,<=cancun")` are all valids.`).
 
 [abi]: https://docs.soliditylang.org/en/latest/abi-spec.html#function-selector
