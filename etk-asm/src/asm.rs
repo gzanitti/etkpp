@@ -142,7 +142,7 @@ mod error {
 
 pub use self::error::Error;
 use crate::ops::expression::Error::{UndefinedVariable, UnknownLabel, UnknownMacro};
-use crate::ops::{self, AbstractOp, Assemble, Expression, MacroDefinition};
+use crate::ops::{self, AbstractOp, Assemble, Expression, Imm, MacroDefinition};
 use etk_ops::HardFork;
 use indexmap::IndexMap;
 use num_bigint::BigInt;
@@ -221,7 +221,7 @@ pub struct Assembler {
     undeclared_labels: HashSet<String>,
 
     /// Pushes that are variable-sized and need to be backpatched.
-    variable_sized_push: Vec<AbstractOp>,
+    variable_sized_push: Vec<VariablePushDef>,
 
     /// Hardfork to use when assembling.
     hardfork: HardFork,
@@ -231,22 +231,25 @@ pub struct Assembler {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabelDef {
     position: usize,
-    updated: bool,
 }
 
 impl LabelDef {
     /// Create a new `LabelDef`.
     pub fn new(position: usize) -> Self {
-        Self {
-            position,
-            updated: false,
-        }
+        Self { position }
     }
 
     /// Get the position of the label.
     pub fn position(&self) -> usize {
         self.position
     }
+}
+
+/// A variable push
+#[derive(Debug, Clone)]
+pub struct VariablePushDef {
+    position: usize,
+    imm: Imm,
 }
 
 impl Assembler {
@@ -323,7 +326,6 @@ impl Assembler {
                         label,
                         Some(LabelDef {
                             position: self.concrete_len,
-                            updated: false,
                         }),
                     )
                     .expect("label should exist");
@@ -368,11 +370,14 @@ impl Assembler {
                             .into_iter()
                             .collect::<Vec<String>>();
 
-                        if let AbstractOp::Push(_) = op {
+                        if let AbstractOp::Push(imm) = op {
                             // Here, we set the size of the push to 2 bytes (min possible value),
                             //  as we don't know the final value of the label yet.
                             self.concrete_len += 2;
-                            self.variable_sized_push.push(op.clone());
+                            self.variable_sized_push.push(VariablePushDef {
+                                position: self.concrete_len,
+                                imm: imm.clone(),
+                            });
                         } else {
                             self.concrete_len += op.size().unwrap();
                         }
@@ -405,24 +410,25 @@ impl Assembler {
 
     fn backpatch_labels(&mut self) -> Result<(), Error> {
         for op in self.variable_sized_push.iter() {
-            if let AbstractOp::Push(imm) = op {
-                let exp = imm
-                    .tree
-                    .eval_with_context((&self.declared_labels, &self.declared_macros).into());
+            let exp = op
+                .imm
+                .tree
+                .eval_with_context((&self.declared_labels, &self.declared_macros).into());
 
-                if let Ok(val) = exp {
-                    let val_bits = BigInt::bits(&val).max(1);
-                    let imm_size = 1 + ((val_bits - 1) / 8);
+            if let Ok(val) = exp {
+                let val_bits = BigInt::bits(&val).max(1);
+                let imm_size = 1 + ((val_bits - 1) / 8);
 
-                    if imm_size > 1 {
-                        for label_value in self.declared_labels.values_mut() {
-                            let labeldef = label_value.as_ref().unwrap();
-                            self.concrete_len += imm_size as usize - 1;
-                            *label_value = Some(LabelDef {
-                                position: labeldef.position + imm_size as usize - 1,
-                                updated: true,
-                            });
+                if imm_size > 1 {
+                    for label_value in self.declared_labels.values_mut() {
+                        let labeldef = label_value.as_ref().unwrap();
+                        if op.position > labeldef.position {
+                            continue;
                         }
+                        self.concrete_len += imm_size as usize - 1;
+                        *label_value = Some(LabelDef {
+                            position: labeldef.position + imm_size as usize - 1,
+                        });
                     }
                 }
             }
@@ -818,10 +824,7 @@ mod tests {
         assert_eq!(asm.declared_labels.len(), 1);
         assert_eq!(
             asm.declared_labels.get("lbl"),
-            Some(&Some(LabelDef {
-                position: 0,
-                updated: false
-            }))
+            Some(&Some(LabelDef { position: 0 }))
         );
         assert_eq!(result, hex!("5b"));
         Ok(())

@@ -12,7 +12,7 @@ This example should increment a value from 0 to 255 on the stack, then halt exec
 
 ```rust
 # extern crate etk_asm;
-# extern create etk_ops;
+# extern crate etk_ops;
 # let src = r#"
 push1 0x00
 
