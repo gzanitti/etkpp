@@ -19,3 +19,4 @@ pub mod ops;
 mod parse;
 
 pub use self::parse::error::ParseError;
+pub use etk_ops::HardFork;
