@@ -149,4 +149,28 @@ The fully expanded source would look like:
 push32 0xa9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b
 ```
 
+## Hardfork selection
+
+### `%hardfork(...)`
+
+The `%hardfork` macro is useful when you want to restrict the hardfork range in which the code can be compiled.
+
+For example:
+
+```rust
+# extern crate etk_asm;
+# extern crate etk_ops;
+# let src = r#"
+%hardfork(">london,<=cancun")
+
+%push(0x08)
+# "#;
+# let mut output = Vec::new();
+# let mut ingest = etk_asm::ingest::Ingest::new(&mut output, etk_ops::HardFork::Cancun);
+# ingest.ingest(file!(), src).unwrap();
+# assert_eq!(output, &[0x60, 0x08]);
+```
+
+can only be compiled by specifying a hardfork using the `--hardfork` flag (with the latest hardfork implemented as the default option) strictly after `London` and equal or older than `Cancun`. Non-closed ranges can also be used, as well as specific versions (e.g. `%hardfork(">london")`, `%hardfork("cancun")` and `%hardfork(">=cancun,<=cancun")` are all valids.`).
+
 [abi]: https://docs.soliditylang.org/en/latest/abi-spec.html#function-selector
