@@ -6,7 +6,7 @@
 mod error {
     use crate::ops::Expression;
     use crate::ParseError;
-    use etk_ops::cancun::Op;
+    use etk_ops::HardForkOp;
     use num_bigint::BigInt;
     use snafu::{Backtrace, Snafu};
 
@@ -53,7 +53,7 @@ mod error {
             value: BigInt,
 
             /// The specifier.
-            spec: Op<()>,
+            spec: HardForkOp<()>,
 
             /// The location of the error.
             backtrace: Backtrace,
@@ -142,9 +142,11 @@ mod error {
 
 pub use self::error::Error;
 use crate::ops::expression::Error::{UndefinedVariable, UnknownLabel, UnknownMacro};
-use crate::ops::{self, AbstractOp, Assemble, Expression, MacroDefinition};
+use crate::ops::{self, AbstractOp, Assemble, Expression, Imm, MacroDefinition};
+use etk_ops::HardFork;
 use indexmap::IndexMap;
 use num_bigint::BigInt;
+
 use rand::Rng;
 use std::collections::{hash_map, HashMap, HashSet};
 
@@ -190,11 +192,12 @@ impl From<&AbstractOp> for RawOp {
 /// use etk_asm::asm::Assembler;
 /// use etk_asm::ops::AbstractOp;
 /// use etk_ops::cancun::{Op, GetPc};
+/// use etk_ops::{HardFork, HardForkOp};
 /// # use etk_asm::asm::Error;
 /// #
 /// # use hex_literal::hex;
-/// let mut asm = Assembler::new();
-/// let code = vec![AbstractOp::new(GetPc)];
+/// let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+/// let code = vec![AbstractOp::new(HardForkOp::Cancun(GetPc.into()))];
 /// let result = asm.assemble(&code)?;
 /// # assert_eq!(result, hex!("58"));
 /// # Result::<(), Error>::Ok(())
@@ -218,23 +221,22 @@ pub struct Assembler {
     undeclared_labels: HashSet<String>,
 
     /// Pushes that are variable-sized and need to be backpatched.
-    variable_sized_push: Vec<AbstractOp>,
+    variable_sized_push: Vec<VariablePushDef>,
+
+    /// Hardfork to use when assembling.
+    hardfork: HardFork,
 }
 
 /// A label definition.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabelDef {
     position: usize,
-    updated: bool,
 }
 
 impl LabelDef {
     /// Create a new `LabelDef`.
     pub fn new(position: usize) -> Self {
-        Self {
-            position,
-            updated: false,
-        }
+        Self { position }
     }
 
     /// Get the position of the label.
@@ -243,10 +245,25 @@ impl LabelDef {
     }
 }
 
+/// A variable push
+#[derive(Debug, Clone)]
+pub struct VariablePushDef {
+    position: usize,
+    imm: Imm,
+}
+
 impl Assembler {
-    /// Create a new `Assembler`.
+    /// Create a new `Assembler` for the last hardfork.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new `Assembler` for an specific hardfork.
+    pub fn new_with_hardfork(hardfork: HardFork) -> Self {
+        Self {
+            hardfork,
+            ..Self::default()
+        }
     }
 
     /// Feed instructions into the `Assembler`.
@@ -309,7 +326,6 @@ impl Assembler {
                         label,
                         Some(LabelDef {
                             position: self.concrete_len,
-                            updated: false,
                         }),
                     )
                     .expect("label should exist");
@@ -320,10 +336,10 @@ impl Assembler {
                 self.expand_macro(&m.name, &m.parameters)?;
             }
             RawOp::Op(ref op) => {
-                match op
-                    .clone()
-                    .concretize((&self.declared_labels, &self.declared_macros).into())
-                {
+                match op.clone().concretize(
+                    (&self.declared_labels, &self.declared_macros).into(),
+                    self.hardfork.clone(),
+                ) {
                     Ok(cop) => {
                         self.concrete_len += cop.size();
                         self.ready.push(rop.clone())
@@ -354,11 +370,14 @@ impl Assembler {
                             .into_iter()
                             .collect::<Vec<String>>();
 
-                        if let AbstractOp::Push(_) = op {
+                        if let AbstractOp::Push(imm) = op {
                             // Here, we set the size of the push to 2 bytes (min possible value),
                             //  as we don't know the final value of the label yet.
                             self.concrete_len += 2;
-                            self.variable_sized_push.push(op.clone());
+                            self.variable_sized_push.push(VariablePushDef {
+                                position: self.concrete_len,
+                                imm: imm.clone(),
+                            });
                         } else {
                             self.concrete_len += op.size().unwrap();
                         }
@@ -391,24 +410,25 @@ impl Assembler {
 
     fn backpatch_labels(&mut self) -> Result<(), Error> {
         for op in self.variable_sized_push.iter() {
-            if let AbstractOp::Push(imm) = op {
-                let exp = imm
-                    .tree
-                    .eval_with_context((&self.declared_labels, &self.declared_macros).into());
+            let exp = op
+                .imm
+                .tree
+                .eval_with_context((&self.declared_labels, &self.declared_macros).into());
 
-                if let Ok(val) = exp {
-                    let val_bits = BigInt::bits(&val).max(1);
-                    let imm_size = 1 + ((val_bits - 1) / 8);
+            if let Ok(val) = exp {
+                let val_bits = BigInt::bits(&val).max(1);
+                let imm_size = 1 + ((val_bits - 1) / 8);
 
-                    if imm_size > 1 {
-                        for label_value in self.declared_labels.values_mut() {
-                            let labeldef = label_value.as_ref().unwrap();
-                            self.concrete_len += imm_size as usize - 1;
-                            *label_value = Some(LabelDef {
-                                position: labeldef.position + imm_size as usize - 1,
-                                updated: true,
-                            });
+                if imm_size > 1 {
+                    for label_value in self.declared_labels.values_mut() {
+                        let labeldef = label_value.as_ref().unwrap();
+                        if op.position > labeldef.position {
+                            continue;
                         }
+                        self.concrete_len += imm_size as usize - 1;
+                        *label_value = Some(LabelDef {
+                            position: labeldef.position + imm_size as usize - 1,
+                        });
                     }
                 }
             }
@@ -462,10 +482,10 @@ impl Assembler {
                 RawOp::Scope(_) => unreachable!("scopes should be expanded"),
             };
 
-            match op
-                .clone()
-                .concretize((&self.declared_labels, &self.declared_macros).into())
-            {
+            match op.clone().concretize(
+                (&self.declared_labels, &self.declared_macros).into(),
+                self.hardfork.clone(),
+            ) {
                 Ok(cop) => cop.assemble(&mut output),
                 Err(ops::Error::ContextIncomplete {
                     source: UnknownLabel { .. },
@@ -579,78 +599,78 @@ mod tests {
         InstructionMacroDefinition, InstructionMacroInvocation, Terminal,
     };
     use assert_matches::assert_matches;
-    use etk_ops::cancun::*;
+    use etk_ops::{cancun::*, HardFork, HardForkOp};
     use hex_literal::hex;
     use num_bigint::{BigInt, Sign};
 
     #[test]
     fn assemble_variable_push_const_while_pending() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![
-            AbstractOp::Op(Push1(Imm::with_label("label1")).into()),
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
+            AbstractOp::Op(HardForkOp::Cancun(Push1(Imm::with_label("label1")).into())),
             AbstractOp::Push(Terminal::Number(0xaabb.into()).into()),
             AbstractOp::Label("label1".into()),
         ];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("600561aabb"));
         Ok(())
     }
 
     #[test]
     fn assemble_variable_pushes_abab() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![
-            AbstractOp::new(JumpDest),
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
             AbstractOp::Push(Imm::with_label("label1")),
             AbstractOp::Push(Imm::with_label("label2")),
             AbstractOp::Label("label1".into()),
-            AbstractOp::new(GetPc),
+            AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
             AbstractOp::Label("label2".into()),
-            AbstractOp::new(GetPc),
+            AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
         ];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b600560065858"));
         Ok(())
     }
 
     #[test]
     fn assemble_variable_pushes_abba() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![
-            AbstractOp::new(JumpDest),
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
             AbstractOp::Push(Imm::with_label("label1")),
             AbstractOp::Push(Imm::with_label("label2")),
             AbstractOp::Label("label2".into()),
-            AbstractOp::new(GetPc),
+            AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
             AbstractOp::Label("label1".into()),
-            AbstractOp::new(GetPc),
+            AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
         ];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b600660055858"));
         Ok(())
     }
 
     #[test]
     fn assemble_variable_push1_multiple() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![
-            AbstractOp::new(JumpDest),
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
             AbstractOp::Push(Imm::with_label("auto")),
             AbstractOp::Push(Imm::with_label("auto")),
             AbstractOp::Label("auto".into()),
         ];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b60056005"));
         Ok(())
     }
 
     #[test]
     fn assemble_variable_push_const() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![AbstractOp::Push(
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![AbstractOp::Push(
             Terminal::Number((0x00aaaaaaaaaaaaaaaaaaaaaaaa as u128).into()).into(),
         )];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("6baaaaaaaaaaaaaaaaaaaaaaaa"));
         Ok(())
     }
@@ -659,69 +679,69 @@ mod tests {
     fn assemble_variable_push_too_large() {
         let v = BigInt::from_bytes_be(Sign::Plus, &[1u8; 33]);
 
-        let mut asm = Assembler::new();
-        let code = vec![AbstractOp::Push(Terminal::Number(v).into())];
-        let err = asm.assemble(&code).unwrap_err();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![AbstractOp::Push(Terminal::Number(v).into())];
+        let err = asm.assemble(&ops).unwrap_err();
 
         assert_matches!(err, Error::ExpressionTooLarge { .. });
     }
 
     #[test]
     fn assemble_variable_push_negative() {
-        let mut asm = Assembler::new();
-        let code = vec![AbstractOp::Push(Terminal::Number((-1).into()).into())];
-        let err = asm.assemble(&code).unwrap_err();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![AbstractOp::Push(Terminal::Number((-1).into()).into())];
+        let err = asm.assemble(&ops).unwrap_err();
 
         assert_matches!(err, Error::ExpressionNegative { .. });
     }
 
     #[test]
     fn assemble_variable_push_const0() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![AbstractOp::Push(
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![AbstractOp::Push(
             Terminal::Number((0x00 as u128).into()).into(),
         )];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("6000"));
         Ok(())
     }
 
     #[test]
     fn assemble_variable_push1_known() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![
-            AbstractOp::new(JumpDest),
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
             AbstractOp::Label("auto".into()),
             AbstractOp::Push(Imm::with_label("auto")),
         ];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b6001"));
         Ok(())
     }
 
     #[test]
     fn assemble_variable_push1() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
             AbstractOp::Push(Imm::with_label("auto")),
             AbstractOp::Label("auto".into()),
-            AbstractOp::new(JumpDest),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
         ];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("60025b"));
         Ok(())
     }
 
     #[test]
     fn assemble_variable_push1_reuse() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
             AbstractOp::Push(Imm::with_label("auto")),
             AbstractOp::Label("auto".into()),
-            AbstractOp::new(JumpDest),
-            AbstractOp::new(Push1(Imm::with_label("auto"))),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("auto")).into())),
         ];
-        let result = asm.assemble(&code)?;
+        let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("60025b6002"));
         Ok(())
     }
@@ -731,13 +751,13 @@ mod tests {
         let mut code = vec![];
         code.push(AbstractOp::Push(Imm::with_label("auto")));
         for _ in 0..255 {
-            code.push(AbstractOp::new(GetPc));
+            code.push(AbstractOp::new(HardForkOp::Cancun(GetPc.into())));
         }
 
         code.push(AbstractOp::Label("auto".into()));
-        code.push(AbstractOp::new(JumpDest));
+        code.push(AbstractOp::new(HardForkOp::Cancun(JumpDest.into())));
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&code)?;
 
         let mut expected = vec![0x61, 0x01, 0x02];
@@ -753,11 +773,11 @@ mod tests {
         let mut code = vec![];
         code.push(AbstractOp::Push(Imm::with_label("auto")));
         for _ in 0..65537 {
-            code.push(AbstractOp::new(GetPc));
+            code.push(AbstractOp::new(HardForkOp::Cancun(GetPc.into())));
         }
 
         code.push(AbstractOp::Label("auto".into()));
-        code.push(AbstractOp::new(JumpDest));
+        code.push(AbstractOp::new(HardForkOp::Cancun(JumpDest.into())));
 
         let mut asm = Assembler::new();
         let result = asm.assemble(&code)?;
@@ -773,18 +793,20 @@ mod tests {
 
     #[test]
     fn assemble_undeclared_label() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![AbstractOp::new(Push1(Imm::with_label("hi")))];
-        let err = asm.assemble(&code).unwrap_err();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![AbstractOp::new(HardForkOp::Cancun(
+            Push1(Imm::with_label("hi")).into(),
+        ))];
+        let err = asm.assemble(&ops).unwrap_err();
         assert_matches!(err, Error::UndeclaredLabels { labels, .. } if labels == vec!["hi"]);
         Ok(())
     }
 
     #[test]
     fn assemble_jumpdest_no_label() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let code = vec![AbstractOp::new(JumpDest)];
-        let result = asm.assemble(&code)?;
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![AbstractOp::new(HardForkOp::Cancun(JumpDest.into()))];
+        let result = asm.assemble(&ops)?;
         assert!(asm.declared_labels.is_empty());
         assert_eq!(result, hex!("5b"));
         Ok(())
@@ -792,17 +814,17 @@ mod tests {
 
     #[test]
     fn assemble_jumpdest_with_label() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let ops = vec![AbstractOp::Label("lbl".into()), AbstractOp::new(JumpDest)];
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![
+            AbstractOp::Label("lbl".into()),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+        ];
 
         let result = asm.assemble(&ops)?;
         assert_eq!(asm.declared_labels.len(), 1);
         assert_eq!(
             asm.declared_labels.get("lbl"),
-            Some(&Some(LabelDef {
-                position: 0,
-                updated: false
-            }))
+            Some(&Some(LabelDef { position: 0 }))
         );
         assert_eq!(result, hex!("5b"));
         Ok(())
@@ -812,11 +834,11 @@ mod tests {
     fn assemble_jumpdest_jump_with_label() -> Result<(), Error> {
         let ops = vec![
             AbstractOp::Label("lbl".into()),
-            AbstractOp::new(JumpDest),
-            AbstractOp::new(Push1(Imm::with_label("lbl"))),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("lbl")).into())),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b6000"));
 
@@ -826,12 +848,12 @@ mod tests {
     #[test]
     fn assemble_labeled_pc() -> Result<(), Error> {
         let ops = vec![
-            AbstractOp::new(Push1(Imm::with_label("lbl"))),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("lbl")).into())),
             AbstractOp::Label("lbl".into()),
-            AbstractOp::new(GetPc),
+            AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("600258"));
 
@@ -841,12 +863,12 @@ mod tests {
     #[test]
     fn assemble_jump_jumpdest_with_label() -> Result<(), Error> {
         let ops = vec![
-            AbstractOp::new(Push1(Imm::with_label("lbl"))),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("lbl")).into())),
             AbstractOp::Label("lbl".into()),
-            AbstractOp::new(JumpDest),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("60025b"));
 
@@ -855,26 +877,30 @@ mod tests {
 
     #[test]
     fn assemble_label_too_large() {
-        let mut ops: Vec<_> = vec![AbstractOp::new(GetPc); 255];
+        let mut ops: Vec<_> = vec![AbstractOp::new(HardForkOp::Cancun(GetPc.into())); 255];
         ops.push(AbstractOp::Label("b".into()));
-        ops.push(AbstractOp::new(JumpDest));
+        ops.push(AbstractOp::new(HardForkOp::Cancun(JumpDest.into())));
         ops.push(AbstractOp::Label("a".into()));
-        ops.push(AbstractOp::new(JumpDest));
-        ops.push(AbstractOp::new(Push1(Imm::with_label("a"))));
-        let mut asm = Assembler::new();
+        ops.push(AbstractOp::new(HardForkOp::Cancun(JumpDest.into())));
+        ops.push(AbstractOp::new(HardForkOp::Cancun(
+            Push1(Imm::with_label("a")).into(),
+        )));
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let err = asm.assemble(&ops).unwrap_err();
         assert_matches!(err, Error::ExpressionTooLarge { expr: Expression::Terminal(Terminal::Label(label)), .. } if label == "a");
     }
 
     #[test]
     fn assemble_label_just_right() -> Result<(), Error> {
-        let mut ops: Vec<_> = vec![AbstractOp::new(GetPc); 255];
+        let mut ops: Vec<_> = vec![AbstractOp::new(HardForkOp::Cancun(GetPc.into())); 255];
         ops.push(AbstractOp::Label("b".into()));
-        ops.push(AbstractOp::new(JumpDest));
+        ops.push(AbstractOp::new(HardForkOp::Cancun(JumpDest.into())));
         ops.push(AbstractOp::Label("a".into()));
-        ops.push(AbstractOp::new(JumpDest));
-        ops.push(AbstractOp::new(Push1(Imm::with_label("b"))));
-        let mut asm = Assembler::new();
+        ops.push(AbstractOp::new(HardForkOp::Cancun(JumpDest.into())));
+        ops.push(AbstractOp::new(HardForkOp::Cancun(
+            Push1(Imm::with_label("b")).into(),
+        )));
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
 
         let mut expected = vec![0x58; 255];
@@ -913,7 +939,7 @@ mod tests {
             }),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, []);
 
@@ -928,15 +954,15 @@ mod tests {
                 parameters: vec![],
                 contents: vec![
                     AbstractOp::Label("a".into()),
-                    AbstractOp::new(JumpDest),
-                    AbstractOp::new(Push1(Imm::with_label("a"))),
-                    AbstractOp::new(Push1(Imm::with_label("b"))),
+                    AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("a")).into())),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
                 ],
             }
             .into(),
             AbstractOp::Label("b".into()),
-            AbstractOp::new(JumpDest),
-            AbstractOp::new(Push1(Imm::with_label("b"))),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
             AbstractOp::Macro(InstructionMacroInvocation {
                 name: "my_macro".into(),
                 parameters: vec![],
@@ -947,7 +973,7 @@ mod tests {
             }),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b60005b600360005b60086000"));
 
@@ -962,22 +988,22 @@ mod tests {
                 parameters: vec![],
                 contents: vec![
                     AbstractOp::Label("a".into()),
-                    AbstractOp::new(JumpDest),
-                    AbstractOp::new(Push1(Imm::with_label("a"))),
-                    AbstractOp::new(Push1(Imm::with_label("b"))),
+                    AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("a")).into())),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
                 ],
             }
             .into(),
             AbstractOp::Label("b".into()),
-            AbstractOp::new(JumpDest),
-            AbstractOp::new(Push1(Imm::with_label("b"))),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
             AbstractOp::Macro(InstructionMacroInvocation {
                 name: "my_macro".into(),
                 parameters: vec![],
             }),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b60005b60036000"));
 
@@ -988,8 +1014,8 @@ mod tests {
     fn assemble_instruction_macro_delayed_definition() -> Result<(), Error> {
         let ops = vec![
             AbstractOp::Label("b".into()),
-            AbstractOp::new(JumpDest),
-            AbstractOp::new(Push1(Imm::with_label("b"))),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
             AbstractOp::Macro(InstructionMacroInvocation {
                 name: "my_macro".into(),
                 parameters: vec![],
@@ -999,15 +1025,15 @@ mod tests {
                 parameters: vec![],
                 contents: vec![
                     AbstractOp::Label("a".into()),
-                    AbstractOp::new(JumpDest),
-                    AbstractOp::new(Push1(Imm::with_label("a"))),
-                    AbstractOp::new(Push1(Imm::with_label("b"))),
+                    AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("a")).into())),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
                 ],
             }
             .into(),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b60005b60036000"));
 
@@ -1025,19 +1051,19 @@ mod tests {
                 name: "my_macro".into(),
                 parameters: vec![],
                 contents: vec![
-                    AbstractOp::new(JumpDest),
+                    AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
                     AbstractOp::Push(Imm::with_label("label1")),
                     AbstractOp::Push(Imm::with_label("label2")),
                     AbstractOp::Label("label1".into()),
-                    AbstractOp::new(GetPc),
+                    AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
                     AbstractOp::Label("label2".into()),
-                    AbstractOp::new(GetPc),
+                    AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
                 ],
             }
             .into(),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b600560065858"));
 
@@ -1049,7 +1075,7 @@ mod tests {
         let ops = vec![AbstractOp::Macro(
             InstructionMacroInvocation::with_zero_parameters("my_macro".into()),
         )];
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let err = asm.assemble(&ops).unwrap_err();
         assert_matches!(err, Error::UndeclaredInstructionMacro { name, .. } if name == "my_macro");
 
@@ -1062,17 +1088,17 @@ mod tests {
             InstructionMacroDefinition {
                 name: "my_macro".into(),
                 parameters: vec![],
-                contents: vec![AbstractOp::new(Caller)],
+                contents: vec![AbstractOp::new(HardForkOp::Cancun(Caller.into()))],
             }
             .into(),
             InstructionMacroDefinition {
                 name: "my_macro".into(),
                 parameters: vec![],
-                contents: vec![AbstractOp::new(Caller)],
+                contents: vec![AbstractOp::new(HardForkOp::Cancun(Caller.into()))],
             }
             .into(),
         ];
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let err = asm.assemble(&ops).unwrap_err();
         assert_matches!(err, Error::DuplicateMacro { name, .. } if name == "my_macro");
 
@@ -1092,7 +1118,7 @@ mod tests {
                 "my_macro".into(),
             )),
         ];
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let err = asm.assemble(&ops).unwrap_err();
         assert_matches!(err, Error::DuplicateLabel { label, .. } if label == "a");
 
@@ -1104,22 +1130,22 @@ mod tests {
     fn assemble_conflicting_labels_in_instruction_macro() -> Result<(), Error> {
         let ops = vec![
             AbstractOp::Label("a".into()),
-            AbstractOp::new(Caller),
+            AbstractOp::new(HardForkOp::Cancun(Caller.into())),
             InstructionMacroDefinition {
                 name: "my_macro()".into(),
                 parameters: vec![],
                 contents: vec![
                     AbstractOp::Label("a".into()),
-                    AbstractOp::new(Push1(Imm::with_label("a"))),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("a")).into())),
                 ],
             }
             .into(),
             AbstractOp::Macro(InstructionMacroInvocation::with_zero_parameters(
                 "my_macro()".into(),
             )),
-            AbstractOp::new(Push1(Imm::with_label("a"))),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("a")).into())),
         ];
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
 
         assert_eq!(result, hex!("3360016000"));
@@ -1134,14 +1160,14 @@ mod tests {
                 name: "my_macro".into(),
                 parameters: vec!["foo".into(), "bar".into()],
                 contents: vec![
-                    AbstractOp::new(Push1(Imm::with_variable("foo"))),
-                    AbstractOp::new(Push1(Imm::with_variable("bar"))),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_variable("foo")).into())),
+                    AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_variable("bar")).into())),
                 ],
             }
             .into(),
             AbstractOp::Label("b".into()),
-            AbstractOp::new(JumpDest),
-            AbstractOp::new(Push1(Imm::with_label("b"))),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
             AbstractOp::Macro(InstructionMacroInvocation {
                 name: "my_macro".into(),
                 parameters: vec![
@@ -1151,7 +1177,7 @@ mod tests {
             }),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("5b600060426000"));
 
@@ -1160,11 +1186,11 @@ mod tests {
 
     #[test]
     fn assemble_expression_push() -> Result<(), Error> {
-        let ops = vec![AbstractOp::new(Push1(Imm::with_expression(
-            Expression::Plus(1.into(), 1.into()),
-        )))];
+        let ops = vec![AbstractOp::new(HardForkOp::Cancun(
+            Push1(Imm::with_expression(Expression::Plus(1.into(), 1.into()))).into(),
+        ))];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("6002"));
 
@@ -1173,10 +1199,10 @@ mod tests {
 
     #[test]
     fn assemble_expression_negative() -> Result<(), Error> {
-        let ops = vec![AbstractOp::new(Push1(Imm::with_expression(
-            BigInt::from(-1).into(),
-        )))];
-        let mut asm = Assembler::new();
+        let ops = vec![AbstractOp::new(HardForkOp::Cancun(
+            Push1(Imm::with_expression(BigInt::from(-1).into())).into(),
+        ))];
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let err = asm.assemble(&ops).unwrap_err();
         assert_matches!(err, Error::ExpressionNegative { value, .. } if value == BigInt::from(-1));
 
@@ -1185,10 +1211,13 @@ mod tests {
 
     #[test]
     fn assemble_expression_undeclared_label() -> Result<(), Error> {
-        let mut asm = Assembler::new();
-        let ops = vec![AbstractOp::new(Push1(Imm::with_expression(
-            Terminal::Label(String::from("hi")).into(),
-        )))];
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
+        let ops = vec![AbstractOp::new(HardForkOp::Cancun(
+            Push1(Imm::with_expression(
+                Terminal::Label(String::from("hi")).into(),
+            ))
+            .into(),
+        ))];
         let err = asm.assemble(&ops).unwrap_err();
         assert_matches!(err, Error::UndeclaredLabels { labels, .. } if labels == vec!["hi"]);
         Ok(())
@@ -1202,7 +1231,7 @@ mod tests {
                 Terminal::Label("foo".into()).into(),
                 BigInt::from(256).into(),
             ))),
-            AbstractOp::new(Push2(Imm::with_label("foo1"))),
+            AbstractOp::new(HardForkOp::Cancun(Push2(Imm::with_label("foo1")).into())),
             AbstractOp::Label("foo".into()),
             AbstractOp::Label("foo1".into()),
         ];
@@ -1219,7 +1248,7 @@ mod tests {
                 Terminal::Label("z".into()).into(),
                 BigInt::from(256).into(),
             ))),
-            AbstractOp::new(Push2(Imm::with_label("a"))),
+            AbstractOp::new(HardForkOp::Cancun(Push2(Imm::with_label("a")).into())),
             AbstractOp::Label("z".into()),
             AbstractOp::Label("a".into()),
         ];
@@ -1236,14 +1265,14 @@ mod tests {
                 Terminal::Label("foo".into()).into(),
                 BigInt::from(256).into(),
             ))),
-            AbstractOp::new(Push2(Imm::with_label("foo"))),
+            AbstractOp::new(HardForkOp::Cancun(Push2(Imm::with_label("foo")).into())),
             AbstractOp::Push(Imm::with_expression(Expression::Plus(
                 Terminal::Label("bar".into()).into(),
                 BigInt::from(256).into(),
             ))),
-            AbstractOp::new(Gas),
+            AbstractOp::new(HardForkOp::Cancun(Gas.into())),
             AbstractOp::Label("foo".into()),
-            AbstractOp::new(Gas),
+            AbstractOp::new(HardForkOp::Cancun(Gas.into())),
             AbstractOp::Label("bar".into()),
         ];
         let result = asm.assemble(&ops)?;
@@ -1260,7 +1289,7 @@ mod tests {
                 Terminal::Label("foo".into()).into(),
                 BigInt::from(256).into(),
             ))),
-            AbstractOp::new(Push2(Imm::with_label("foo1"))),
+            AbstractOp::new(HardForkOp::Cancun(Push2(Imm::with_label("foo1")).into())),
             AbstractOp::Push(Imm::with_expression(Expression::Plus(
                 Terminal::Label("foo".into()).into(),
                 BigInt::from(256).into(),
@@ -1281,12 +1310,12 @@ mod tests {
                 Terminal::Label("foo".into()).into(),
                 BigInt::from(256).into(),
             ))),
-            AbstractOp::new(Push2(Imm::with_label("foo1"))),
+            AbstractOp::new(HardForkOp::Cancun(Push2(Imm::with_label("foo1")).into())),
             AbstractOp::Push(Imm::with_expression(Expression::Plus(
                 Terminal::Label("foo".into()).into(),
                 BigInt::from(256).into(),
             ))),
-            AbstractOp::new(Push2(Imm::with_label("foo1"))),
+            AbstractOp::new(HardForkOp::Cancun(Push2(Imm::with_label("foo1")).into())),
             AbstractOp::Label("foo".into()),
             AbstractOp::Label("foo1".into()),
         ];
@@ -1297,14 +1326,14 @@ mod tests {
 
     #[test]
     fn assemble_variable_push_expression_with_undeclared_labels() -> Result<(), Error> {
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let ops = vec![
-            AbstractOp::new(JumpDest),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
             AbstractOp::Push(Imm::with_expression(Expression::Plus(
                 Terminal::Label("foo".into()).into(),
                 Terminal::Label("bar".into()).into(),
             ))),
-            AbstractOp::new(Gas),
+            AbstractOp::new(HardForkOp::Cancun(Gas.into())),
         ];
         let err = asm.assemble(&ops).unwrap_err();
         // The expressions have short-circuit evaluation, so only the first label is caught in the error.
@@ -1321,15 +1350,18 @@ mod tests {
         // pc # repeat 126 times.
         // lbl1:
         // lbl2:
-        let mut ops = vec![AbstractOp::new(GetPc); 130];
+        let mut ops = vec![AbstractOp::new(HardForkOp::Cancun(GetPc.into())); 130];
         ops[0] = AbstractOp::Push(Imm::with_expression(Expression::Minus(
             Terminal::Label(String::from("lbl1")).into(),
             Terminal::Label(String::from("lbl2")).into(),
         )));
-        ops[1] = AbstractOp::new(Push2(
-            Expression::Plus(
-                Terminal::Label(String::from("lbl1")).into(),
-                Terminal::Label(String::from("lbl2")).into(),
+        ops[1] = AbstractOp::new(HardForkOp::Cancun(
+            Push2(
+                Expression::Plus(
+                    Terminal::Label(String::from("lbl1")).into(),
+                    Terminal::Label(String::from("lbl2")).into(),
+                )
+                .into(),
             )
             .into(),
         ));
@@ -1362,9 +1394,9 @@ mod tests {
 
     #[test]
     fn assemble_variable_push1_expression() -> Result<(), Error> {
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let ops = vec![
-            AbstractOp::new(JumpDest),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
             AbstractOp::Label("auto".into()),
             AbstractOp::Push(Imm::with_expression(Expression::Plus(
                 1.into(),
@@ -1378,14 +1410,14 @@ mod tests {
 
     #[test]
     fn assemble_expression_with_labels() -> Result<(), Error> {
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let ops = vec![
-            AbstractOp::new(JumpDest),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
             AbstractOp::Push(Imm::with_expression(Expression::Plus(
                 Terminal::Label(String::from("foo")).into(),
                 Terminal::Label(String::from("bar")).into(),
             ))),
-            AbstractOp::new(Gas),
+            AbstractOp::new(HardForkOp::Cancun(Gas.into())),
             AbstractOp::Label("foo".into()),
             AbstractOp::Label("bar".into()),
         ];
@@ -1403,13 +1435,16 @@ mod tests {
                 content: Imm::with_expression(Expression::Plus(1.into(), 1.into())),
             }
             .into(),
-            AbstractOp::new(Push1(Imm::with_macro(ExpressionMacroInvocation {
-                name: "foo".into(),
-                parameters: vec![],
-            }))),
+            AbstractOp::new(HardForkOp::Cancun(
+                Push1(Imm::with_macro(ExpressionMacroInvocation {
+                    name: "foo".into(),
+                    parameters: vec![],
+                }))
+                .into(),
+            )),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("6002"));
 
@@ -1422,19 +1457,21 @@ mod tests {
             InstructionMacroDefinition {
                 name: "my_macro".into(),
                 parameters: vec!["foo".into()],
-                contents: vec![AbstractOp::new(Push1(Imm::with_variable("bar")))],
+                contents: vec![AbstractOp::new(HardForkOp::Cancun(
+                    Push1(Imm::with_variable("bar")).into(),
+                ))],
             }
             .into(),
             AbstractOp::Label("b".into()),
-            AbstractOp::new(JumpDest),
-            AbstractOp::new(Push1(Imm::with_label("b"))),
+            AbstractOp::new(HardForkOp::Cancun(JumpDest.into())),
+            AbstractOp::new(HardForkOp::Cancun(Push1(Imm::with_label("b")).into())),
             AbstractOp::Macro(InstructionMacroInvocation {
                 name: "my_macro".into(),
                 parameters: vec![BigInt::from_bytes_be(Sign::Plus, &vec![0x42]).into()],
             }),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let err = asm.assemble(&ops).unwrap_err();
 
         assert_matches!(err, Error::UndeclaredVariableMacro { var, .. } if var == "bar");
@@ -1443,7 +1480,7 @@ mod tests {
     #[test]
     fn assemble_instruction_macro_two_delayed_definitions_mirrored() -> Result<(), Error> {
         let ops = vec![
-            AbstractOp::new(GetPc),
+            AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
             AbstractOp::Macro(InstructionMacroInvocation {
                 name: "macro1".into(),
                 parameters: vec![],
@@ -1455,18 +1492,18 @@ mod tests {
             InstructionMacroDefinition {
                 name: "macro0".into(),
                 parameters: vec![],
-                contents: vec![AbstractOp::new(JumpDest)],
+                contents: vec![AbstractOp::new(HardForkOp::Cancun(JumpDest.into()))],
             }
             .into(),
             InstructionMacroDefinition {
                 name: "macro1".into(),
                 parameters: vec![],
-                contents: vec![AbstractOp::new(Caller)],
+                contents: vec![AbstractOp::new(HardForkOp::Cancun(Caller.into()))],
             }
             .into(),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("58335b"));
 
@@ -1476,7 +1513,7 @@ mod tests {
     #[test]
     fn assemble_instruction_macro_two_delayed_definitions() -> Result<(), Error> {
         let ops = vec![
-            AbstractOp::new(GetPc),
+            AbstractOp::new(HardForkOp::Cancun(GetPc.into())),
             AbstractOp::Macro(InstructionMacroInvocation {
                 name: "macro0".into(),
                 parameters: vec![],
@@ -1488,18 +1525,18 @@ mod tests {
             InstructionMacroDefinition {
                 name: "macro0".into(),
                 parameters: vec![],
-                contents: vec![AbstractOp::new(JumpDest)],
+                contents: vec![AbstractOp::new(HardForkOp::Cancun(JumpDest.into()))],
             }
             .into(),
             InstructionMacroDefinition {
                 name: "macro1".into(),
                 parameters: vec![],
-                contents: vec![AbstractOp::new(Caller)],
+                contents: vec![AbstractOp::new(HardForkOp::Cancun(Caller.into()))],
             }
             .into(),
         ];
 
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new_with_hardfork(HardFork::Cancun);
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("585b33"));
 
