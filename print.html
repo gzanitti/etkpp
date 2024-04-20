@@ -856,6 +856,27 @@ jumpdest
 <p>The fully expanded source would look like:</p>
 <pre><code class="language-ignore">push32 0xa9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b
 </code></pre>
+<h2 id="hardfork-selection"><a class="header" href="#hardfork-selection">Hardfork selection</a></h2>
+<h3 id="hardfork"><a class="header" href="#hardfork"><code>%hardfork(...)</code></a></h3>
+<p>The <code>%hardfork</code> macro is useful when you want to restrict the hardfork range in which the code can be compiled.</p>
+<p>For example:</p>
+<pre><pre class="playground"><code class="language-rust edition2018">
+<span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span><span class="boring">extern crate etk_asm;
+</span><span class="boring">extern crate etk_ops;
+</span><span class="boring">let src = r#&quot;
+</span>%hardfork(&quot;&gt;london,&lt;=cancun&quot;)
+
+%push(0x08)
+<span class="boring">&quot;#;
+</span><span class="boring">let mut output = Vec::new();
+</span><span class="boring">let mut ingest = etk_asm::ingest::Ingest::new(&amp;mut output, etk_ops::HardFork::Cancun);
+</span><span class="boring">ingest.ingest(file!(), src).unwrap();
+</span><span class="boring">assert_eq!(output, &amp;[0x60, 0x08]);
+</span><span class="boring">}
+</span></code></pre></pre>
+<p>can only be compiled by specifying a hardfork using the <code>--hardfork</code> flag (with the latest hardfork implemented as the default option) strictly after <code>London</code> and equal or older than <code>Cancun</code>. Non-closed ranges can also be used, as well as specific versions (e.g. <code>%hardfork(&quot;&gt;london&quot;)</code>, <code>%hardfork(&quot;cancun&quot;)</code> and <code>%hardfork(&quot;&gt;=cancun,&lt;=cancun&quot;)</code> are all valids.`).</p>
 <h1 id="expression-macros-2"><a class="header" href="#expression-macros-2">Expression Macros</a></h1>
 <p>An <strong>expression macro</strong> is a type of expression which is resolved during assembly. This is useful for defining constant values or constant functions on values, such as defining getters on memory pointers.</p>
 <h2 id="defining-an-expression-macro"><a class="header" href="#defining-an-expression-macro">Defining an Expression Macro</a></h2>
