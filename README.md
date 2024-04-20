@@ -2,7 +2,7 @@
 
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](https://github.com/gzanitti/etkpp)
 
-`etk` is a fork of the original [ETK](https://github.com/quilt/etk), a collection of tools for writing, reading, and analyzing EVM bytecode, but with new features, tweaks and small modifications.
+`etkpp` is a fork of the original [ETK](https://github.com/quilt/etk), a collection of tools for writing, reading, and analyzing EVM bytecode, but with new features, tweaks and small modifications.
 
 ## Documentation
 
