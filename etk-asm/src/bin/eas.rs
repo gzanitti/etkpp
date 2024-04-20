@@ -57,7 +57,11 @@ fn run() -> Result<(), Error> {
     let hex_out = HexWrite::new(&mut out);
 
     let mut ingest = Ingest::new(hex_out, hardfork);
-    ingest.ingest_file(opt.input)?;
+
+    let ingest_str = match opt.asm {
+        Some(str) => ingest.ingest_str(str)?,
+        None => ingest.ingest_file(opt.input)?,
+    };
 
     out.write_all(b"\n").unwrap();
 

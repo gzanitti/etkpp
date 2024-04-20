@@ -304,6 +304,11 @@ where
         Ok(())
     }
 
+    /// Assembly instructions from `src` as if they were read from a string
+    pub fn ingest_str(&mut self, src: &str) -> Result<(), Error> {
+        self.ingest(PathBuf::from(""), src)
+    }
+
     /// Assemble instructions from `src` as if they were read from a file located
     /// at `path`.
     pub fn ingest<P>(&mut self, path: P, text: &str) -> Result<(), Error>
@@ -468,6 +473,63 @@ mod tests {
         ingest.ingest(root, &text)?;
 
         assert_eq!(output, hex!("60015b586000566002"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_str() -> Result<(), Error> {
+        let text = r#"
+            push1 1
+            push1 2
+        "#;
+
+        let mut output = Vec::new();
+        let mut ingest = Ingest::new(&mut output, HardFork::Cancun);
+        ingest.ingest_str(text)?;
+        assert_eq!(output, hex!("60016002"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_str_include() -> Result<(), Error> {
+        let (f, _root) = new_file("push1 42");
+
+        let text = format!(
+            r#"
+            push1 1
+            %include("{}")
+            push1 2
+        "#,
+            f.path().display()
+        );
+
+        let mut output = Vec::new();
+        let mut ingest = Ingest::new(&mut output, HardFork::Cancun);
+        ingest.ingest_str(&text)?;
+        assert_eq!(output, hex!("6001602a6002"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_str_import() -> Result<(), Error> {
+        let (f, _root) = new_file("push1 42");
+
+        let text = format!(
+            r#"
+            push1 1
+            %import("{}")
+            push1 2
+        "#,
+            f.path().display()
+        );
+
+        let mut output = Vec::new();
+        let mut ingest = Ingest::new(&mut output, HardFork::Cancun);
+        ingest.ingest_str(&text)?;
+        assert_eq!(output, hex!("6001602a6002"));
 
         Ok(())
     }
